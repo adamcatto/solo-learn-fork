@@ -17,35 +17,42 @@
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import argparse
 from typing import Any, List, Sequence
 
-import omegaconf
 import torch
 import torch.nn as nn
 from solo.losses.barlow import barlow_loss_func
 from solo.methods.base import BaseMethod
-from solo.utils.misc import omegaconf_select
 
+
+class PrintLayer(nn.Module):
+    def __init__(self, msg):
+        super(PrintLayer, self).__init__()
+        self.msg = msg
+ 
+    def forward(self, x):
+        # Do your print / debug stuff here
+        print(str(self.msg) + ' layer shape: ' + str(x.shape))
+        return x
 
 class BarlowTwins(BaseMethod):
-    def __init__(self, cfg: omegaconf.DictConfig):
+    def __init__(
+        self, proj_hidden_dim: int, proj_output_dim: int, lamb: float, scale_loss: float, **kwargs
+    ):
         """Implements Barlow Twins (https://arxiv.org/abs/2103.03230)
 
-        Extra cfg settings:
-            method_kwargs:
-                proj_hidden_dim (int): number of neurons of the hidden layers of the projector.
-                proj_output_dim (int): number of dimensions of projected features.
-                lamb (float): off-diagonal scaling factor for the cross-covariance matrix.
-                scale_loss (float): scaling factor of the loss.
+        Args:
+            proj_hidden_dim (int): number of neurons of the hidden layers of the projector.
+            proj_output_dim (int): number of dimensions of projected features.
+            lamb (float): off-diagonal scaling factor for the cross-covariance matrix.
+            scale_loss (float): scaling factor of the loss.
         """
 
-        super().__init__(cfg)
+        super().__init__(**kwargs)
 
-        self.lamb: float = cfg.method_kwargs.lamb
-        self.scale_loss: float = cfg.method_kwargs.scale_loss
-
-        proj_hidden_dim: int = cfg.method_kwargs.proj_hidden_dim
-        proj_output_dim: int = cfg.method_kwargs.proj_output_dim
+        self.lamb = lamb
+        self.scale_loss = scale_loss
 
         # projector
         self.projector = nn.Sequential(
@@ -59,25 +66,18 @@ class BarlowTwins(BaseMethod):
         )
 
     @staticmethod
-    def add_and_assert_specific_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfig:
-        """Adds method specific default values/checks for config.
+    def add_model_specific_args(parent_parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        parent_parser = super(BarlowTwins, BarlowTwins).add_model_specific_args(parent_parser)
+        parser = parent_parser.add_argument_group("barlow_twins")
 
-        Args:
-            cfg (omegaconf.DictConfig): DictConfig object.
+        # projector
+        parser.add_argument("--proj_output_dim", type=int, default=2048)
+        parser.add_argument("--proj_hidden_dim", type=int, default=2048)
 
-        Returns:
-            omegaconf.DictConfig: same as the argument, used to avoid errors.
-        """
-
-        cfg = super(BarlowTwins, BarlowTwins).add_and_assert_specific_cfg(cfg)
-
-        assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.proj_hidden_dim")
-        assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.proj_output_dim")
-
-        cfg.method_kwargs.lamb = omegaconf_select(cfg, "method_kwargs.lamb", 0.0051)
-        cfg.method_kwargs.scale_loss = omegaconf_select(cfg, "method_kwargs.scale_loss", 0.024)
-
-        return cfg
+        # parameters
+        parser.add_argument("--lamb", type=float, default=0.0051)
+        parser.add_argument("--scale_loss", type=float, default=0.024)
+        return parent_parser
 
     @property
     def learnable_params(self) -> List[dict]:
@@ -87,7 +87,7 @@ class BarlowTwins(BaseMethod):
             List[dict]: list of learnable parameters.
         """
 
-        extra_learnable_params = [{"name": "projector", "params": self.projector.parameters()}]
+        extra_learnable_params = [{"params": self.projector.parameters()}]
         return super().learnable_params + extra_learnable_params
 
     def forward(self, X):
@@ -101,6 +101,7 @@ class BarlowTwins(BaseMethod):
         """
 
         out = super().forward(X)
+        out['feats'] = torch.squeeze(out['feats'])
         z = self.projector(out["feats"])
         out.update({"z": z})
         return out

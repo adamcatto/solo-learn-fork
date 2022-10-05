@@ -19,6 +19,7 @@
 
 from typing import Dict, List, Sequence
 
+import numpy as np
 import torch
 
 
@@ -67,7 +68,9 @@ def weighted_mean(outputs: List[Dict], key: str, batch_size_key: str) -> float:
     value = 0
     n = 0
     for out in outputs:
-        value += out[batch_size_key] * out[key]
+        if torch.isnan(torch.mean(torch.tensor(out[key]).float())):
+            return torch.tensor(float('inf'))
+        value += out[batch_size_key] * torch.mean(torch.tensor(out[key]).float())
         n += out[batch_size_key]
     value = value / n
     return value.squeeze(0)

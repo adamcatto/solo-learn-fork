@@ -17,37 +17,42 @@
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import argparse
 from typing import Any, Dict, List, Sequence, Tuple
 
-import omegaconf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from solo.losses.mocov2plus import mocov2plus_loss_func
 from solo.methods.base import BaseMomentumMethod
-from solo.utils.misc import gather, omegaconf_select
 from solo.utils.momentum import initialize_momentum_params
+from solo.utils.misc import gather
 
 
 class MoCoV2Plus(BaseMomentumMethod):
-    def __init__(self, cfg: omegaconf.DictConfig):
+    queue: torch.Tensor
+
+    def __init__(
+        self,
+        proj_output_dim: int,
+        proj_hidden_dim: int,
+        temperature: float,
+        queue_size: int,
+        **kwargs
+    ):
         """Implements MoCo V2+ (https://arxiv.org/abs/2011.10566).
 
-        Extra cfg settings:
-            method_kwargs:
-                proj_output_dim (int): number of dimensions of projected features.
-                proj_hidden_dim (int): number of neurons of the hidden layers of the projector.
-                temperature (float): temperature for the softmax in the contrastive loss.
-                queue_size (int): number of samples to keep in the queue.
+        Args:
+            proj_output_dim (int): number of dimensions of projected features.
+            proj_hidden_dim (int): number of neurons of the hidden layers of the projector.
+            temperature (float): temperature for the softmax in the contrastive loss.
+            queue_size (int): number of samples to keep in the queue.
         """
 
-        super().__init__(cfg)
+        super().__init__(**kwargs)
 
-        self.temperature: float = cfg.method_kwargs.temperature
-        self.queue_size: int = cfg.method_kwargs.queue_size
-
-        proj_hidden_dim: int = cfg.method_kwargs.proj_hidden_dim
-        proj_output_dim: int = cfg.method_kwargs.proj_output_dim
+        self.temperature = temperature
+        self.queue_size = queue_size
 
         # projector
         self.projector = nn.Sequential(
@@ -65,30 +70,26 @@ class MoCoV2Plus(BaseMomentumMethod):
         initialize_momentum_params(self.projector, self.momentum_projector)
 
         # create the queue
-        self.register_buffer("queue", torch.randn(2, proj_output_dim, self.queue_size))
+        self.register_buffer("queue", torch.randn(2, proj_output_dim, queue_size))
         self.queue = nn.functional.normalize(self.queue, dim=1)
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
     @staticmethod
-    def add_and_assert_specific_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfig:
-        """Adds method specific default values/checks for config.
+    def add_model_specific_args(parent_parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        parent_parser = super(MoCoV2Plus, MoCoV2Plus).add_model_specific_args(parent_parser)
+        parser = parent_parser.add_argument_group("mocov2plus")
 
-        Args:
-            cfg (omegaconf.DictConfig): DictConfig object.
+        # projector
+        parser.add_argument("--proj_output_dim", type=int, default=128)
+        parser.add_argument("--proj_hidden_dim", type=int, default=2048)
 
-        Returns:
-            omegaconf.DictConfig: same as the argument, used to avoid errors.
-        """
+        # parameters
+        parser.add_argument("--temperature", type=float, default=0.1)
 
-        cfg = super(MoCoV2Plus, MoCoV2Plus).add_and_assert_specific_cfg(cfg)
+        # queue settings
+        parser.add_argument("--queue_size", default=65536, type=int)
 
-        assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.proj_output_dim")
-        assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.proj_hidden_dim")
-        assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.temperature")
-
-        cfg.method_kwargs.queue_size = omegaconf_select(cfg, "method_kwargs.queue_size", 65536)
-
-        return cfg
+        return parent_parser
 
     @property
     def learnable_params(self) -> List[dict]:
@@ -98,7 +99,7 @@ class MoCoV2Plus(BaseMomentumMethod):
             List[dict]: list of learnable parameters.
         """
 
-        extra_learnable_params = [{"name": "projector", "params": self.projector.parameters()}]
+        extra_learnable_params = [{"params": self.projector.parameters()}]
         return super().learnable_params + extra_learnable_params
 
     @property

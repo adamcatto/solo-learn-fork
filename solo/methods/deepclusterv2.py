@@ -17,40 +17,43 @@
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import argparse
 from typing import Any, Dict, List, Sequence
 
-import omegaconf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from solo.losses.deepclusterv2 import deepclusterv2_loss_func
 from solo.methods.base import BaseMethod
 from solo.utils.kmeans import KMeans
-from solo.utils.misc import omegaconf_select
 
 
 class DeepClusterV2(BaseMethod):
-    def __init__(self, cfg: omegaconf.DictConfig):
+    def __init__(
+        self,
+        proj_output_dim: int,
+        proj_hidden_dim: int,
+        num_prototypes: Sequence[int],
+        temperature: float,
+        kmeans_iters: int,
+        **kwargs,
+    ):
         """Implements DeepCluster V2 (https://arxiv.org/abs/2006.09882).
 
-        Extra cfg settings:
-            method_kwargs:
-                proj_output_dim (int): number of dimensions of the projected features.
-                proj_hidden_dim (int): number of neurons in the hidden layers of the projector.
-                num_prototypes (Sequence[int]): number of prototypes.
-                temperature (float): temperature for the softmax.
-                kmeans_iters (int): number of iterations for k-means clustering.
+        Args:
+            proj_output_dim (int): number of dimensions of the projected features.
+            proj_hidden_dim (int): number of neurons in the hidden layers of the projector.
+            num_prototypes (Sequence[int]): number of prototypes.
+            temperature (float): temperature for the softmax.
+            kmeans_iters (int): number of iterations for k-means clustering.
         """
 
-        super().__init__(cfg)
+        super().__init__(**kwargs)
 
-        self.proj_output_dim: int = cfg.method_kwargs.proj_output_dim
-        self.temperature: float = cfg.method_kwargs.temperature
-        self.num_prototypes: Sequence[int] = cfg.method_kwargs.num_prototypes
-        self.kmeans_iters: int = cfg.method_kwargs.kmeans_iters
-
-        proj_hidden_dim: int = cfg.method_kwargs.proj_hidden_dim
-        proj_output_dim: int = cfg.method_kwargs.proj_output_dim
+        self.proj_output_dim = proj_output_dim
+        self.temperature = temperature
+        self.num_prototypes = num_prototypes
+        self.kmeans_iters = kmeans_iters
 
         # projector
         self.projector = nn.Sequential(
@@ -62,7 +65,7 @@ class DeepClusterV2(BaseMethod):
 
         # prototypes
         self.prototypes = nn.ModuleList(
-            [nn.Linear(proj_output_dim, np, bias=False) for np in self.num_prototypes]
+            [nn.Linear(proj_output_dim, np, bias=False) for np in num_prototypes]
         )
         # normalize and set requires grad to false
         for proto in self.prototypes:
@@ -71,30 +74,20 @@ class DeepClusterV2(BaseMethod):
             proto.weight.copy_(F.normalize(proto.weight.data.clone(), dim=-1))
 
     @staticmethod
-    def add_and_assert_specific_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfig:
-        """Adds method specific default values/checks for config.
+    def add_model_specific_args(parent_parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        parent_parser = super(DeepClusterV2, DeepClusterV2).add_model_specific_args(parent_parser)
+        parser = parent_parser.add_argument_group("deepclusterv2")
 
-        Args:
-            cfg (omegaconf.DictConfig): DictConfig object.
+        # projector
+        parser.add_argument("--proj_output_dim", type=int, default=128)
+        parser.add_argument("--proj_hidden_dim", type=int, default=2048)
 
-        Returns:
-            omegaconf.DictConfig: same as the argument, used to avoid errors.
-        """
+        # parameters
+        parser.add_argument("--temperature", type=float, default=0.1)
+        parser.add_argument("--num_prototypes", type=int, nargs="+", default=[3000, 3000, 3000])
+        parser.add_argument("--kmeans_iters", type=int, default=10)
 
-        cfg = super(DeepClusterV2, DeepClusterV2).add_and_assert_specific_cfg(cfg)
-
-        assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.proj_hidden_dim")
-        assert not omegaconf.OmegaConf.is_missing(cfg, "method_kwargs.proj_output_dim")
-
-        cfg.method_kwargs.temperature = omegaconf_select(cfg, "method_kwargs.temperature", 0.1)
-        cfg.method_kwargs.num_prototypes = omegaconf_select(
-            cfg,
-            "method_kwargs.num_prototypes",
-            [3000, 3000, 3000],
-        )
-        cfg.method_kwargs.kmeans_iters = omegaconf_select(cfg, "method_kwargs.kmeans_iters", 10)
-
-        return cfg
+        return parent_parser
 
     @property
     def learnable_params(self) -> List[dict]:
@@ -104,19 +97,16 @@ class DeepClusterV2(BaseMethod):
             List[dict]: list of learnable parameters.
         """
 
-        extra_learnable_params = [{"name": "projector", "params": self.projector.parameters()}]
+        extra_learnable_params = [{"params": self.projector.parameters()}]
         return super().learnable_params + extra_learnable_params
 
     def on_train_start(self):
         """Gets the world size and initializes the memory banks."""
         #  k-means needs the world size and the dataset size
         self.world_size = self.trainer.world_size if self.trainer else 1
-
-        try:
-            self.dataset_size = len(self.trainer.train_dataloader.dataset)
-        except:
-            # get dataset size from dali
-            self.dataset_size = self.trainer.train_dataloader.loaders.dataset_size
+        self.dataset_size = getattr(self, "dali_epoch_size", None) or len(
+            self.trainer.train_dataloader.dataset
+        )
 
         # build k-means helper object
         self.kmeans = KMeans(

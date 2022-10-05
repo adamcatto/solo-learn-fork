@@ -18,10 +18,10 @@
 # DEALINGS IN THE SOFTWARE.
 
 import logging
+from argparse import ArgumentParser
 from functools import partial
-from typing import Any, Callable, Dict, List, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-import omegaconf
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -53,15 +53,13 @@ from solo.backbones import (
 from solo.utils.knn import WeightedKNNClassifier
 from solo.utils.lars import LARS
 from solo.utils.metrics import accuracy_at_k, weighted_mean
-from solo.utils.misc import omegaconf_select, remove_bias_and_norm_from_weight_decay
+from solo.utils.misc import remove_bias_and_norm_from_weight_decay
 from solo.utils.momentum import MomentumUpdater, initialize_momentum_params
 from torch.optim.lr_scheduler import MultiStepLR
 
 
 def static_lr(
-    get_lr: Callable,
-    param_group_indexes: Sequence[int],
-    lrs_to_replace: Sequence[float],
+    get_lr: Callable, param_group_indexes: Sequence[int], lrs_to_replace: Sequence[float]
 ):
     lrs = get_lr()
     for idx, lr in zip(param_group_indexes, lrs_to_replace):
@@ -107,54 +105,72 @@ class BaseMethod(pl.LightningModule):
         "none",
     ]
 
-    def __init__(self, cfg: omegaconf.DictConfig):
+    def __init__(
+        self,
+        backbone: str,
+        num_classes: int,
+        backbone_args: dict,
+        max_epochs: int,
+        batch_size: int,
+        optimizer: str,
+        lr: float,
+        weight_decay: float,
+        classifier_lr: float,
+        accumulate_grad_batches: Union[int, None],
+        extra_optimizer_args: Dict,
+        scheduler: str,
+        num_large_crops: int,
+        num_small_crops: int,
+        min_lr: float = 0.0,
+        warmup_start_lr: float = 0.00003,
+        warmup_epochs: float = 10,
+        scheduler_interval: str = "step",
+        lr_decay_steps: Sequence = None,
+        knn_eval: bool = False,
+        knn_k: int = 20,
+        no_channel_last: bool = False,
+        use_clf: bool = False,
+        **kwargs,
+    ):
         """Base model that implements all basic operations for all self-supervised methods.
         It adds shared arguments, extract basic learnable parameters, creates optimizers
         and schedulers, implements basic training_step for any number of crops,
         trains the online classifier and implements validation_step.
 
-        .. note:: Cfg defaults are set in init by calling `cfg = add_and_assert_specific_cfg(cfg)`
-
-        Cfg basic structure:
-            backbone:
-                name (str): architecture of the base backbone.
-                kwargs (dict): extra backbone kwargs.
-            data:
-                dataset (str): name of the dataset.
-                num_classes (int): number of classes.
-            max_epochs (int): number of training epochs.
-
+        Args:
+            backbone (str): architecture of the base backbone.
+            num_classes (int): number of classes.
             backbone_params (dict): dict containing extra backbone args, namely:
+                #! optional, if it's not present, it is considered as False
+                cifar (bool): flag indicating if cifar is being used.
                 #! only for resnet
                 zero_init_residual (bool): change the initialization of the resnet backbone.
                 #! only for vit
                 patch_size (int): size of the patches for ViT.
-            optimizer:
-                name (str): name of the optimizer.
-                batch_size (int): number of samples in the batch.
-                lr (float): learning rate.
-                weight_decay (float): weight decay for optimizer.
-                classifier_lr (float): learning rate for the online linear classifier.
-                kwargs (Dict): extra named arguments for the optimizer.
-            scheduler:
-                name (str): name of the scheduler.
-                min_lr (float): minimum learning rate for warmup scheduler. Defaults to 0.0.
-                warmup_start_lr (float): initial learning rate for warmup scheduler.
-                    Defaults to 0.00003.
-                warmup_epochs (float): number of warmup epochs. Defaults to 10.
-                lr_decay_steps (Sequence, optional): steps to decay the learning rate if scheduler is
-                    step. Defaults to None.
-                interval (str): interval to update the lr scheduler. Defaults to 'step'.
-            knn_eval:
-                enabled (bool): enables online knn evaluation while training.
-                k (int): the number of neighbors to use for knn.
-            performance:
-                disable_channel_last (bool). Disables channel last conversion operation which
-                speeds up training considerably. Defaults to False.
-                https://pytorch.org/tutorials/intermediate/memory_format_tutorial.html#converting-existing-models
+            max_epochs (int): number of training epochs.
+            batch_size (int): number of samples in the batch.
+            optimizer (str): name of the optimizer.
+            lr (float): learning rate.
+            weight_decay (float): weight decay for optimizer.
+            classifier_lr (float): learning rate for the online linear classifier.
             accumulate_grad_batches (Union[int, None]): number of batches for gradient accumulation.
+            extra_optimizer_args (Dict): extra named arguments for the optimizer.
+            scheduler (str): name of the scheduler.
             num_large_crops (int): number of big crops.
             num_small_crops (int): number of small crops .
+            min_lr (float): minimum learning rate for warmup scheduler. Defaults to 0.0.
+            warmup_start_lr (float): initial learning rate for warmup scheduler.
+                Defaults to 0.00003.
+            warmup_epochs (float): number of warmup epochs. Defaults to 10.
+            scheduler_interval (str): interval to update the lr scheduler. Defaults to 'step'.
+            lr_decay_steps (Sequence, optional): steps to decay the learning rate if scheduler is
+                step. Defaults to None.
+            knn_eval (bool): enables online knn evaluation while training.
+            knn_k (int): the number of neighbors to use for knn.
+            no_channel_last (bool). Disables channel last conversion operation which
+                speeds up training considerably. Defaults to False.
+                https://pytorch.org/tutorials/intermediate/memory_format_tutorial.html#converting-existing-models
+            use_clf (bool): append a classifier for online evaluation. (default: False)
 
         .. note::
             When using distributed data parallel, the batch size and the number of workers are
@@ -163,8 +179,8 @@ class BaseMethod(pl.LightningModule):
             workers).
 
         .. note::
-            The learning rate (base, min and warmup) is automatically scaled linearly
-            if using gradient accumulation.
+            The learning rate (base, min and warmup) is automatically scaled linearly based on the
+            batch size and gradient accumulation.
 
         .. note::
             For CIFAR10/100, the first convolutional and maxpooling layers of the ResNet backbone
@@ -174,65 +190,42 @@ class BaseMethod(pl.LightningModule):
 
         super().__init__()
 
-        # add default values and assert that config has the basic needed settings
-        cfg = self.add_and_assert_specific_cfg(cfg)
-
-        self.cfg: omegaconf.DictConfig = cfg
-
-        ########## Backbone ##########
-        self.backbone_args: Dict[str, Any] = cfg.backbone.kwargs
-        assert cfg.backbone.name in BaseMethod._BACKBONES
-        self.base_model: Callable = self._BACKBONES[cfg.backbone.name]
-        self.backbone_name: str = cfg.backbone.name
-        # initialize backbone
-        kwargs = self.backbone_args.copy()
-
-        method: str = cfg.method
-        self.backbone: nn.Module = self.base_model(method, **kwargs)
-        if self.backbone_name.startswith("resnet"):
-            self.features_dim: int = self.backbone.inplanes
-            # remove fc layer
-            self.backbone.fc = nn.Identity()
-            cifar = cfg.data.dataset in ["cifar10", "cifar100"]
-            if cifar:
-                self.backbone.conv1 = nn.Conv2d(
-                    3, 64, kernel_size=3, stride=1, padding=2, bias=False
-                )
-                self.backbone.maxpool = nn.Identity()
-        else:
-            self.features_dim: int = self.backbone.num_features
-        ##############################
-
-        # online linear classifier
-        self.num_classes: int = cfg.data.num_classes
-        self.classifier: nn.Module = nn.Linear(self.features_dim, self.num_classes)
+        # resnet backbone related
+        self.backbone_args = backbone_args
 
         # training related
-        self.max_epochs: int = cfg.max_epochs
-        self.accumulate_grad_batches: Union[int, None] = cfg.accumulate_grad_batches
+        self.num_classes = num_classes
+        self.max_epochs = max_epochs
+        self.batch_size = batch_size
+        self.optimizer = optimizer
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.classifier_lr = classifier_lr
+        self.accumulate_grad_batches = accumulate_grad_batches
+        self.extra_optimizer_args = extra_optimizer_args
+        self.scheduler = scheduler
+        self.lr_decay_steps = lr_decay_steps
+        self.min_lr = min_lr
+        self.warmup_start_lr = warmup_start_lr
+        self.warmup_epochs = warmup_epochs
+        assert scheduler_interval in ["step", "epoch"]
+        self.scheduler_interval = scheduler_interval
+        self.num_large_crops = num_large_crops
+        self.num_small_crops = num_small_crops
+        self.knn_eval = knn_eval
+        self.knn_k = knn_k
+        self.no_channel_last = no_channel_last
+        self.use_clf = use_clf
+        self.use_clf_loss = use_clf
 
-        # optimizer related
-        self.optimizer: str = cfg.optimizer.name
-        self.batch_size: int = cfg.optimizer.batch_size
-        self.lr: float = cfg.optimizer.lr
-        self.weight_decay: float = cfg.optimizer.weight_decay
-        self.classifier_lr: float = cfg.optimizer.classifier_lr
-        self.extra_optimizer_args: Dict[str, Any] = cfg.optimizer.kwargs
-        self.exclude_bias_n_norm_wd: bool = cfg.optimizer.exclude_bias_n_norm_wd
+        # multicrop
+        self.num_crops = self.num_large_crops + self.num_small_crops
 
-        # scheduler related
-        self.scheduler: str = cfg.scheduler.name
-        self.lr_decay_steps: Union[List[int], None] = cfg.scheduler.lr_decay_steps
-        self.min_lr: float = cfg.scheduler.min_lr
-        self.warmup_start_lr: float = cfg.scheduler.warmup_start_lr
-        self.warmup_epochs: int = cfg.scheduler.warmup_epochs
-        self.scheduler_interval: str = cfg.scheduler.interval
-        assert self.scheduler_interval in ["step", "epoch"]
-        if self.scheduler_interval == "step":
-            logging.warn(
-                f"Using scheduler_interval={self.scheduler_interval} might generate "
-                "issues when resuming a checkpoint."
-            )
+        # all the other parameters
+        self.extra_args = kwargs
+
+        # turn on multicrop if there are small crops
+        self.multicrop = self.num_small_crops != 0
 
         # if accumulating gradient then scale lr
         if self.accumulate_grad_batches:
@@ -241,69 +234,113 @@ class BaseMethod(pl.LightningModule):
             self.min_lr = self.min_lr * self.accumulate_grad_batches
             self.warmup_start_lr = self.warmup_start_lr * self.accumulate_grad_batches
 
-        # data-related
-        self.num_large_crops: int = cfg.data.num_large_crops
-        self.num_small_crops: int = cfg.data.num_small_crops
-        self.num_crops: int = self.num_large_crops + self.num_small_crops
-        # turn on multicrop if there are small crops
-        self.multicrop: bool = self.num_small_crops != 0
+        assert backbone in BaseMethod._BACKBONES
+        self.base_model = self._BACKBONES[backbone]
 
-        # knn online evaluation
-        self.knn_eval: bool = cfg.knn_eval.enabled
-        self.knn_k: int = cfg.knn_eval.k
+        self.backbone_name = backbone
+
+        # initialize backbone
+        kwargs = self.backbone_args.copy()
+        cifar = kwargs.pop("cifar", False)
+        # swin specific
+        if "swin" in self.backbone_name and cifar:
+            kwargs["window_size"] = 4
+
+        method = self.extra_args.get("method", None)
+        self.backbone = self.base_model(method, **kwargs)
+        if self.backbone_name.startswith("resnet"):
+            self.features_dim = self.backbone.inplanes
+            # remove fc layer
+            self.backbone.fc = nn.Identity()
+            if cifar:
+                self.backbone.conv1 = nn.Conv2d(
+                    3, 64, kernel_size=3, stride=1, padding=2, bias=False
+                )
+                self.backbone.maxpool = nn.Identity()
+        else:
+            self.features_dim = self.backbone.num_features
+
+        self.classifier = nn.Linear(self.features_dim, num_classes)
+
         if self.knn_eval:
-            self.knn = WeightedKNNClassifier(k=self.knn_k, distance_fx=cfg.knn.distance_func)
+            self.knn = WeightedKNNClassifier(k=self.knn_k, distance_fx="euclidean")
 
-        # for performance
-        self.no_channel_last = cfg.performance.disable_channel_last
+        if scheduler_interval == "step":
+            logging.warn(
+                f"Using scheduler_interval={scheduler_interval} might generate "
+                "issues when resuming a checkpoint."
+            )
+
+       
 
     @staticmethod
-    def add_and_assert_specific_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfig:
-        """Adds method specific default values/checks for config.
+    def add_model_specific_args(parent_parser: ArgumentParser) -> ArgumentParser:
+        """Adds shared basic arguments that are shared for all methods.
 
         Args:
-            cfg (omegaconf.DictConfig): DictConfig object.
+            parent_parser (ArgumentParser): argument parser that is used to create a
+                argument group.
 
         Returns:
-            omegaconf.DictConfig: same as the argument, used to avoid errors.
+            ArgumentParser: same as the argument, used to avoid errors.
         """
 
-        # default for extra backbone kwargs (use pytorch's default if not available)
-        cfg.backbone.kwargs = omegaconf_select(cfg, "backbone.kwargs", {})
+        parser = parent_parser.add_argument_group("base")
 
-        # default parameters for optimizer
-        cfg.optimizer.exclude_bias_n_norm_wd = omegaconf_select(
-            cfg, "optimizer.exclude_bias_n_norm_wd", False
+        # backbone args
+        BACKBONES = BaseMethod._BACKBONES
+
+        parser.add_argument("--backbone", choices=BACKBONES, type=str)
+        # extra args for resnet
+        parser.add_argument("--zero_init_residual", action="store_true")
+        # extra args for ViT
+        parser.add_argument("--patch_size", type=int, default=16)
+
+        # general train
+        parser.add_argument("--batch_size", type=int, default=128)
+        parser.add_argument("--lr", type=float, default=0.3)
+        parser.add_argument("--classifier_lr", type=float, default=0.3)
+        parser.add_argument("--weight_decay", type=float, default=0.0001)
+        parser.add_argument("--num_workers", type=int, default=4)
+
+        # wandb
+        parser.add_argument("--name")
+        parser.add_argument("--project")
+        parser.add_argument("--entity", default=None, type=str)
+        parser.add_argument("--wandb", action="store_true")
+        parser.add_argument("--offline", action="store_true")
+
+        parser.add_argument(
+            "--optimizer", choices=BaseMethod._OPTIMIZERS.keys(), type=str, required=True
         )
-        # default for extra optimizer kwargs (use pytorch's default if not available)
-        cfg.optimizer.kwargs = omegaconf_select(cfg, "optimizer.kwargs", {})
+        parser.add_argument("--exclude_bias_n_norm_wd", action="store_true")
+        # lars args
+        parser.add_argument("--grad_clip_lars", action="store_true")
+        parser.add_argument("--eta_lars", default=1e-3, type=float)
+        parser.add_argument("--exclude_bias_n_norm_lars", action="store_true")
+        # adamw args
+        parser.add_argument("--adamw_beta1", default=0.9, type=float)
+        parser.add_argument("--adamw_beta2", default=0.999, type=float)
 
-        # default for acc grad batches
-        cfg.accumulate_grad_batches = omegaconf_select(cfg, "accumulate_grad_batches", None)
-
-        # default parameters for the scheduler
-        cfg.scheduler.lr_decay_steps = omegaconf_select(cfg, "scheduler.lr_decay_steps", None)
-        cfg.scheduler.min_lr = omegaconf_select(cfg, "scheduler.min_lr", 0.0)
-        cfg.scheduler.warmup_start_lr = omegaconf_select(cfg, "scheduler.warmup_start_lr", 3e-5)
-        cfg.scheduler.warmup_epochs = omegaconf_select(cfg, "scheduler.warmup_epochs", 10)
-        cfg.scheduler.interval = omegaconf_select(cfg, "scheduler.interval", "step")
-
-        # default parameters for knn eval
-        cfg.knn_eval = omegaconf_select(cfg, "knn_eval", {})
-        cfg.knn_eval.enabled = omegaconf_select(cfg, "knn_eval.enabled", False)
-        cfg.knn_eval.k = omegaconf_select(cfg, "knn_eval.k", 20)
-        cfg.knn_eval.distance_func = omegaconf_select(cfg, "knn_eval.distance_func", "euclidean")
-
-        # default parameters for performance optimization
-        cfg.performance = omegaconf_select(cfg, "performance", {})
-        cfg.performance.disable_channel_last = omegaconf_select(
-            cfg, "performance.disable_channel_last", False
+        parser.add_argument(
+            "--scheduler", choices=BaseMethod._SCHEDULERS, type=str, default="reduce"
+        )
+        parser.add_argument("--lr_decay_steps", default=None, type=int, nargs="+")
+        parser.add_argument("--min_lr", default=0.0, type=float)
+        parser.add_argument("--warmup_start_lr", default=0.00003, type=float)
+        parser.add_argument("--warmup_epochs", default=10, type=int)
+        parser.add_argument(
+            "--scheduler_interval", choices=["step", "epoch"], default="step", type=str
         )
 
-        # default empty parameters for method-specific kwargs
-        cfg.method_kwargs = omegaconf_select(cfg, "method_kwargs", {})
+        # online knn eval
+        parser.add_argument("--knn_eval", action="store_true")
+        parser.add_argument("--knn_k", default=20, type=int)
 
-        return cfg
+        # disables channel last optimization
+        parser.add_argument("--no_channel_last", action="store_true")
+
+        return parent_parser
 
     @property
     def learnable_params(self) -> List[Dict[str, Any]]:
@@ -334,7 +371,7 @@ class BaseMethod(pl.LightningModule):
         learnable_params = self.learnable_params
 
         # exclude bias and norm from weight decay
-        if self.exclude_bias_n_norm_wd:
+        if self.extra_args.get("exclude_bias_n_norm_wd", False):
             learnable_params = remove_bias_and_norm_from_weight_decay(learnable_params)
 
         # indexes of parameters without lr scheduler
@@ -424,8 +461,11 @@ class BaseMethod(pl.LightningModule):
 
         if not self.no_channel_last:
             X = X.to(memory_format=torch.channels_last)
-        feats = self.backbone(X)
-        logits = self.classifier(feats.detach())
+        feats = torch.squeeze(self.backbone(X))
+        if self.use_clf:
+            logits = self.classifier(feats.detach())
+        else:
+            logits = torch.tensor(float('nan'))
         return {"logits": logits, "feats": feats}
 
     def multicrop_forward(self, X: torch.tensor) -> Dict[str, Any]:
@@ -443,10 +483,10 @@ class BaseMethod(pl.LightningModule):
 
         if not self.no_channel_last:
             X = X.to(memory_format=torch.channels_last)
-        feats = self.backbone(X)
+        feats = torch.squeeze(self.backbone(X))
         return {"feats": feats}
 
-    def _base_shared_step(self, X: torch.Tensor, targets: torch.Tensor) -> Dict:
+    def _base_shared_step(self, X: torch.Tensor, targets: Optional[torch.Tensor]=None, use_clf_loss=False) -> Dict:
         """Forwards a batch of images X and computes the classification loss, the logits, the
         features, acc@1 and acc@5.
 
@@ -460,16 +500,19 @@ class BaseMethod(pl.LightningModule):
 
         out = self(X)
         logits = out["logits"]
-
-        loss = F.cross_entropy(logits, targets, ignore_index=-1)
-        # handle when the number of classes is smaller than 5
-        top_k_max = min(5, logits.size(1))
-        acc1, acc5 = accuracy_at_k(logits, targets, top_k=(1, top_k_max))
+        if targets is not None and use_clf_loss: # then need to replace multicrop_forward with forward
+            loss = F.cross_entropy(logits, targets, ignore_index=-1)
+            # handle when the number of classes is smaller than 5
+            top_k_max = min(5, logits.size(1))
+            acc1, acc5 = accuracy_at_k(logits, targets, top_k=(1, top_k_max))
+        else:
+            loss = 0
+            acc1, acc5 = (0,0)
 
         out.update({"loss": loss, "acc1": acc1, "acc5": acc5})
         return out
 
-    def base_training_step(self, X: torch.Tensor, targets: torch.Tensor) -> Dict:
+    def base_training_step(self, X: torch.Tensor, targets: torch.Tensor, use_clf_loss=False) -> Dict:
         """Allows user to re-write how the forward step behaves for the training_step.
         Should always return a dict containing, at least, "loss", "acc1" and "acc5".
         Defaults to _base_shared_step
@@ -482,9 +525,9 @@ class BaseMethod(pl.LightningModule):
             Dict: dict containing the classification loss, logits, features, acc@1 and acc@5.
         """
 
-        return self._base_shared_step(X, targets)
+        return self._base_shared_step(X, targets, use_clf_loss=use_clf_loss)
 
-    def training_step(self, batch: List[Any], batch_idx: int) -> Dict[str, Any]:
+    def training_step(self, batch: List[Any], batch_idx: int, use_clf_loss=False) -> Dict[str, Any]:
         """Training step for pytorch lightning. It does all the shared operations, such as
         forwarding the crops, computing logits and computing statistics.
 
@@ -497,14 +540,17 @@ class BaseMethod(pl.LightningModule):
             Dict[str, Any]: dict with the classification loss, features and logits.
         """
 
-        _, X, targets = batch
+        if len(batch) == 3:
+            _, X, targets = batch
+        else:
+            X, targets = batch
 
         X = [X] if isinstance(X, torch.Tensor) else X
 
         # check that we received the desired number of crops
         assert len(X) == self.num_crops
 
-        outs = [self.base_training_step(x, targets) for x in X[: self.num_large_crops]]
+        outs = [self.base_training_step(x, targets, use_clf_loss=use_clf_loss) for x in X[: self.num_large_crops]]
         outs = {k: [out[k] for out in outs] for k in outs[0].keys()}
 
         if self.multicrop:
@@ -523,7 +569,7 @@ class BaseMethod(pl.LightningModule):
             "train_acc5": outs["acc5"],
         }
 
-        self.log_dict(metrics, on_epoch=True, sync_dist=True)
+        self.log_dict(metrics, on_epoch=True, on_step=False, sync_dist=True)
 
         if self.knn_eval:
             targets = targets.repeat(self.num_large_crops)
@@ -535,7 +581,7 @@ class BaseMethod(pl.LightningModule):
 
         return outs
 
-    def base_validation_step(self, X: torch.Tensor, targets: torch.Tensor) -> Dict:
+    def base_validation_step(self, X: torch.Tensor, targets: torch.Tensor, use_clf_loss=False) -> Dict:
         """Allows user to re-write how the forward step behaves for the validation_step.
         Should always return a dict containing, at least, "loss", "acc1" and "acc5".
         Defaults to _base_shared_step
@@ -548,10 +594,10 @@ class BaseMethod(pl.LightningModule):
             Dict: dict containing the classification loss, logits, features, acc@1 and acc@5.
         """
 
-        return self._base_shared_step(X, targets)
+        return self._base_shared_step(X, targets, use_clf_loss=use_clf_loss)
 
     def validation_step(
-        self, batch: List[torch.Tensor], batch_idx: int, dataloader_idx: int = None
+        self, batch: List[torch.Tensor], batch_idx: int, dataloader_idx: int = None, use_clf_loss=False
     ) -> Dict[str, Any]:
         """Validation step for pytorch lightning. It does all the shared operations, such as
         forwarding a batch of images, computing logits and computing metrics.
@@ -568,17 +614,22 @@ class BaseMethod(pl.LightningModule):
         X, targets = batch
         batch_size = targets.size(0)
 
-        out = self.base_validation_step(X, targets)
+        # check that we received the desired number of crops
+        assert len(X) == self.num_crops
+
+        outs = [self.base_validation_step(x, targets, use_clf_loss=use_clf_loss) for x in X[: self.num_large_crops]]
+        outs = {k: [out[k] for out in outs] for k in outs[0].keys()}
 
         if self.knn_eval and not self.trainer.sanity_checking:
-            self.knn(test_features=out.pop("feats").detach(), test_targets=targets.detach())
+            self.knn(test_features=outs.pop("feats").detach(), test_targets=targets.detach())
 
         metrics = {
             "batch_size": batch_size,
-            "val_loss": out["loss"],
-            "val_acc1": out["acc1"],
-            "val_acc5": out["acc5"],
+            "val_loss": outs["loss"],
+            "val_acc1": outs["acc1"],
+            "val_acc5": outs["acc5"],
         }
+        self.log_dict(metrics, on_epoch=True, on_step=False, sync_dist=True)
         return metrics
 
     def validation_epoch_end(self, outs: List[Dict[str, Any]]):
@@ -600,13 +651,16 @@ class BaseMethod(pl.LightningModule):
             val_knn_acc1, val_knn_acc5 = self.knn.compute()
             log.update({"val_knn_acc1": val_knn_acc1, "val_knn_acc5": val_knn_acc5})
 
-        self.log_dict(log, sync_dist=True)
+       # self.log_dict(log, sync_dist=True)
 
 
 class BaseMomentumMethod(BaseMethod):
     def __init__(
         self,
-        cfg: omegaconf.DictConfig,
+        base_tau_momentum: float,
+        final_tau_momentum: float,
+        momentum_classifier: bool,
+        **kwargs,
     ):
         """Base momentum model that implements all basic operations for all self-supervised methods
         that use a momentum backbone. It adds shared momentum arguments, adds basic learnable
@@ -614,40 +668,47 @@ class BaseMomentumMethod(BaseMethod):
         classifier. Also implements momentum update using exponential moving average and cosine
         annealing of the weighting decrease coefficient.
 
-        Extra cfg settings:
-            momentum:
-                base_tau (float): base value of the weighting decrease coefficient in [0,1].
-                final_tau (float): final value of the weighting decrease coefficient in [0,1].
-                classifier (bool): whether or not to train a classifier on top of the momentum backbone.
+        Args:
+            base_tau_momentum (float): base value of the weighting decrease coefficient (should be
+                in [0,1]).
+            final_tau_momentum (float): final value of the weighting decrease coefficient (should be
+                in [0,1]).
+            momentum_classifier (bool): whether or not to train a classifier on top of the momentum
+                backbone.
         """
 
-        super().__init__(cfg)
+        super().__init__(**kwargs)
 
-        # initialize momentum backbone
+        # momentum backbone
         kwargs = self.backbone_args.copy()
+        cifar = kwargs.pop("cifar", False)
+        # swin specific
+        if "swin" in self.backbone_name and cifar:
+            kwargs["window_size"] = 4
 
-        method: str = cfg.method
-        self.momentum_backbone: nn.Module = self.base_model(method, **kwargs)
+        method = self.extra_args.get("method", None)
+        self.momentum_backbone = self.base_model(method, **kwargs)
         if self.backbone_name.startswith("resnet"):
             # remove fc layer
             self.momentum_backbone.fc = nn.Identity()
-            cifar = cfg.data.dataset in ["cifar10", "cifar100"]
             if cifar:
                 self.momentum_backbone.conv1 = nn.Conv2d(
                     3, 64, kernel_size=3, stride=1, padding=2, bias=False
                 )
                 self.momentum_backbone.maxpool = nn.Identity()
+        else:
+            self.features_dim = self.momentum_backbone.num_features
 
         initialize_momentum_params(self.backbone, self.momentum_backbone)
 
         # momentum classifier
-        if cfg.momentum.classifier:
+        if momentum_classifier:
             self.momentum_classifier: Any = nn.Linear(self.features_dim, self.num_classes)
         else:
             self.momentum_classifier = None
 
         # momentum updater
-        self.momentum_updater = MomentumUpdater(cfg.momentum.base_tau, cfg.momentum.final_tau)
+        self.momentum_updater = MomentumUpdater(base_tau_momentum, final_tau_momentum)
 
     @property
     def learnable_params(self) -> List[Dict[str, Any]]:
@@ -681,23 +742,28 @@ class BaseMomentumMethod(BaseMethod):
         return [(self.backbone, self.momentum_backbone)]
 
     @staticmethod
-    def add_and_assert_specific_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfig:
-        """Adds method specific default values/checks for config.
+    def add_model_specific_args(parent_parser: ArgumentParser) -> ArgumentParser:
+        """Adds basic momentum arguments that are shared for all methods.
 
         Args:
-            cfg (omegaconf.DictConfig): DictConfig object.
+            parent_parser (ArgumentParser): argument parser that is used to create a
+                argument group.
 
         Returns:
-            omegaconf.DictConfig: same as the argument, used to avoid errors.
+            ArgumentParser: same as the argument, used to avoid errors.
         """
 
-        cfg = super(BaseMomentumMethod, BaseMomentumMethod).add_and_assert_specific_cfg(cfg)
+        parent_parser = super(BaseMomentumMethod, BaseMomentumMethod).add_model_specific_args(
+            parent_parser
+        )
+        parser = parent_parser.add_argument_group("base")
 
-        cfg.momentum.base_tau = omegaconf_select(cfg, "momentum.base_tau", 0.99)
-        cfg.momentum.final_tau = omegaconf_select(cfg, "momentum.final_tau", 1.0)
-        cfg.momentum.classifier = omegaconf_select(cfg, "momentum.classifier", False)
+        # momentum settings
+        parser.add_argument("--base_tau_momentum", default=0.99, type=float)
+        parser.add_argument("--final_tau_momentum", default=1.0, type=float)
+        parser.add_argument("--momentum_classifier", action="store_true")
 
-        return cfg
+        return parent_parser
 
     def on_train_start(self):
         """Resets the step counter at the beginning of training."""
@@ -717,10 +783,10 @@ class BaseMomentumMethod(BaseMethod):
 
         if not self.no_channel_last:
             X = X.to(memory_format=torch.channels_last)
-        feats = self.momentum_backbone(X)
+        feats = torch.squeeze(self.momentum_backbone(X))
         return {"feats": feats}
 
-    def _shared_step_momentum(self, X: torch.Tensor, targets: torch.Tensor) -> Dict[str, Any]:
+    def _shared_step_momentum(self, X: torch.Tensor, targets: Optional[torch.Tensor]=None, use_clf_loss=False) -> Dict[str, Any]:
         """Forwards a batch of images X in the momentum backbone and optionally computes the
         classification loss, the logits, the features, acc@1 and acc@5 for of momentum classifier.
 
@@ -739,14 +805,18 @@ class BaseMomentumMethod(BaseMethod):
         if self.momentum_classifier is not None:
             feats = out["feats"]
             logits = self.momentum_classifier(feats)
-
-            loss = F.cross_entropy(logits, targets, ignore_index=-1)
+            if targets is not None and use_clf_loss:
+                loss = F.cross_entropy(logits, targets, ignore_index=-1)
+                acc1, acc5 = accuracy_at_k(logits, targets, top_k=(1, 5))
+            else:
+                loss = 0
+                acc1, acc5 = (0,0)
             acc1, acc5 = accuracy_at_k(logits, targets, top_k=(1, 5))
             out.update({"logits": logits, "loss": loss, "acc1": acc1, "acc5": acc5})
 
         return out
 
-    def training_step(self, batch: List[Any], batch_idx: int) -> Dict[str, Any]:
+    def training_step(self, batch: List[Any], batch_idx: int, use_clf_loss=False) -> Dict[str, Any]:
         """Training step for pytorch lightning. It performs all the shared operations for the
         momentum backbone and classifier, such as forwarding the crops in the momentum backbone
         and classifier, and computing statistics.
@@ -760,9 +830,13 @@ class BaseMomentumMethod(BaseMethod):
                 loss and logits of the momentum classifier.
         """
 
-        outs = super().training_step(batch, batch_idx)
+        outs = super().training_step(batch, batch_idx, use_clf_loss=use_clf_loss)
 
-        _, X, targets = batch
+        if len(batch) == 3:
+            _, X, targets = batch
+        else:
+            X, targets = batch
+        
         X = [X] if isinstance(X, torch.Tensor) else X
 
         # remove small crops
@@ -790,7 +864,7 @@ class BaseMomentumMethod(BaseMethod):
                 "train_momentum_acc1": momentum_outs["momentum_acc1"],
                 "train_momentum_acc5": momentum_outs["momentum_acc5"],
             }
-            self.log_dict(metrics, on_epoch=True, sync_dist=True)
+            self.log_dict(metrics, on_epoch=True, on_step=False, sync_dist=True)
 
             # adds the momentum classifier loss together with the general loss
             outs["loss"] += momentum_outs["momentum_loss"]
@@ -839,22 +913,44 @@ class BaseMomentumMethod(BaseMethod):
         """
 
         parent_metrics = super().validation_step(batch, batch_idx)
-
-        X, targets = batch
+        if len(batch) == 3:
+            _, X, targets = batch
+        else:
+            X, targets = batch
         batch_size = targets.size(0)
+        X = [X] if isinstance(X, torch.Tensor) else X
 
-        out = self._shared_step_momentum(X, targets)
+        # remove small crops
+        X = X[: self.num_large_crops]
 
-        metrics = None
+        momentum_outs = [self._shared_step_momentum(x, targets) for x in X]
+        momentum_outs = {
+            "momentum_" + k: [out[k] for out in momentum_outs] for k in momentum_outs[0].keys()
+        }
+
         if self.momentum_classifier is not None:
+            # momentum loss and stats
+            momentum_outs["momentum_loss"] = (
+                sum(momentum_outs["momentum_loss"]) / self.num_large_crops
+            )
+            momentum_outs["momentum_acc1"] = (
+                sum(momentum_outs["momentum_acc1"]) / self.num_large_crops
+            )
+            momentum_outs["momentum_acc5"] = (
+                sum(momentum_outs["momentum_acc5"]) / self.num_large_crops
+            )
             metrics = {
-                "batch_size": batch_size,
-                "momentum_val_loss": out["loss"],
-                "momentum_val_acc1": out["acc1"],
-                "momentum_val_acc5": out["acc5"],
+                "train_momentum_class_loss": momentum_outs["momentum_loss"],
+                "train_momentum_acc1": momentum_outs["momentum_acc1"],
+                "train_momentum_acc5": momentum_outs["momentum_acc5"],
             }
+            self.log_dict(metrics, on_epoch=True, on_step=False, sync_dist=True)
 
-        return parent_metrics, metrics
+            # adds the momentum classifier loss together with the general loss
+            parent_metrics["loss"] += momentum_outs["momentum_loss"]
+
+        parent_metrics.update(momentum_outs)
+        return parent_metrics
 
     def validation_epoch_end(self, outs: Tuple[List[Dict[str, Any]]]):
         """Averages the losses and accuracies of the momentum backbone / classifier for all the
@@ -865,8 +961,7 @@ class BaseMomentumMethod(BaseMethod):
                 and the parent.
         """
 
-        parent_outs = [out[0] for out in outs]
-        super().validation_epoch_end(parent_outs)
+        super().validation_epoch_end(outs)
 
         if self.momentum_classifier is not None:
             momentum_outs = [out[1] for out in outs]
@@ -880,4 +975,4 @@ class BaseMomentumMethod(BaseMethod):
                 "momentum_val_acc1": val_acc1,
                 "momentum_val_acc5": val_acc5,
             }
-            self.log_dict(log, sync_dist=True)
+            # self.log_dict(log, sync_dist=True)
