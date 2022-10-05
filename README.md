@@ -12,6 +12,10 @@ A library of self-supervised methods for unsupervised visual representation lear
 We aim at providing SOTA self-supervised methods in a comparable environment while, at the same time, implementing training tricks.
 The library is self-contained, but it is possible to use the models outside of solo-learn. **More details in our [paper](#bib)**.
 
+## Note on Fork
+
+This fork has modified the original base classes to enable pretraining without using associated labels. As it stands, the main (non-forked) repository breaks if you try to feed it data without labels (e.g. benchmark datasets), thus cannot be used in real applications for which labeled data is scarce.
+
 ---
 
 ## News
