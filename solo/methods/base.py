@@ -623,6 +623,10 @@ class BaseMethod(pl.LightningModule):
         if self.knn_eval and not self.trainer.sanity_checking:
             self.knn(test_features=outs.pop("feats").detach(), test_targets=targets.detach())
 
+        outs["loss"] = sum(outs["loss"]) / self.num_large_crops
+        outs["acc1"] = sum(outs["acc1"]) / self.num_large_crops
+        outs["acc5"] = sum(outs["acc5"]) / self.num_large_crops
+
         metrics = {
             "batch_size": batch_size,
             "val_loss": outs["loss"],

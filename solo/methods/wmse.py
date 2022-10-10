@@ -140,4 +140,27 @@ class WMSE(BaseMethod):
 
         self.log("train_wmse_loss", wmse_loss, on_epoch=True, sync_dist=True)
 
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        v = torch.cat(out["z"])
+
+        # ------- wmse loss -------
+        bs = self.batch_size
+        num_losses, wmse_loss = 0, 0
+        for _ in range(self.whitening_iters):
+            z = torch.empty_like(v)
+            perm = torch.randperm(bs).view(-1, self.whitening_size)
+            for idx in perm:
+                for i in range(self.num_large_crops):
+                    z[idx + i * bs] = self.whitening(v[idx + i * bs]).type_as(z)
+            for i in range(self.num_large_crops - 1):
+                for j in range(i + 1, self.num_large_crops):
+                    x0 = z[i * bs : (i + 1) * bs]
+                    x1 = z[j * bs : (j + 1) * bs]
+                    wmse_loss += wmse_loss_func(x0, x1)
+                    num_losses += 1
+        wmse_loss /= num_losses
+
+        self.log("val_loss", wmse_loss, on_epoch=True, sync_dist=True)
         return wmse_loss + class_loss

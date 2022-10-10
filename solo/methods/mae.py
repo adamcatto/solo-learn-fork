@@ -252,3 +252,27 @@ class MAE(BaseMethod):
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
         return reconstruction_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        out = super().training_step(batch, batch_idx)
+        class_loss = out["loss"]
+
+        patch_size = self._vit_patch_size
+        imgs = batch[1]
+        reconstruction_loss = 0
+        for i in range(self.num_large_crops):
+            reconstruction_loss += mae_loss_func(
+                imgs[i],
+                out["pred"][i],
+                out["mask"][i],
+                patch_size,
+                norm_pix_loss=self.norm_pix_loss,
+            )
+        reconstruction_loss /= self.num_large_crops
+
+        metrics = {
+            "val_loss": reconstruction_loss,
+        }
+        self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+        return reconstruction_loss + class_loss

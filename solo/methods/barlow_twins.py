@@ -128,3 +128,12 @@ class BarlowTwins(BaseMethod):
         self.log("train_barlow_loss", barlow_loss, on_epoch=True, sync_dist=True)
 
         return barlow_loss + class_loss
+
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out['loss']
+        z1, z2 = out['z']
+        barlow_loss = barlow_loss_func(z1, z2, lamb=self.lamb, scale_loss=self.scale_loss)
+        self.log('val_loss', barlow_loss, on_epoch=True, sync_dist=True)
+        return barlow_loss + class_loss

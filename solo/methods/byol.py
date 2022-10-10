@@ -196,3 +196,28 @@ class BYOL(BaseMomentumMethod):
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
         return neg_cos_sim + class_loss
+
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        Z = out["z"]
+        P = out["p"]
+        Z_momentum = out["momentum_z"]
+
+        # ------- negative consine similarity loss -------
+        neg_cos_sim = 0
+        for v1 in range(self.num_large_crops):
+            for v2 in np.delete(range(self.num_crops), v1):
+                neg_cos_sim += byol_loss_func(P[v2], Z_momentum[v1])
+
+        # calculate std of features
+        with torch.no_grad():
+            z_std = F.normalize(torch.stack(Z[: self.num_large_crops]), dim=-1).std(dim=1).mean()
+
+        metrics = {
+            "val_neg_cos_sim": neg_cos_sim,
+            "val_z_std": z_std,
+            'val_loss': neg_cos_sim # for checkpointing ease...
+        }
+        self.log_dict(metrics, on_epoch=True, sync_dist=True)

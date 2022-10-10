@@ -197,3 +197,25 @@ class MoCoV2Plus(BaseMomentumMethod):
         self.log("train_nce_loss", nce_loss, on_epoch=True, sync_dist=True)
 
         return nce_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        q1, q2 = out["z"]
+        k1, k2 = out["momentum_z"]
+
+        # ------- contrastive loss -------
+        # symmetric
+        queue = self.queue.clone().detach()
+        nce_loss = (
+            mocov2plus_loss_func(q1, k2, queue[1], self.temperature)
+            + mocov2plus_loss_func(q2, k1, queue[0], self.temperature)
+        ) / 2
+
+        # ------- update queue -------
+        keys = torch.stack((gather(k1), gather(k2)))
+        self._dequeue_and_enqueue(keys)
+
+        self.log("val_loss", nce_loss, on_epoch=True, sync_dist=True)
+
+        return nce_loss + class_loss

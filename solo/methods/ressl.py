@@ -195,3 +195,21 @@ class ReSSL(BaseMomentumMethod):
         self.dequeue_and_enqueue(k)
 
         return ressl_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        q, _ = out["z"]
+        _, k = out["momentum_z"]
+
+        # ------- contrastive loss -------
+        queue = self.queue.clone().detach()
+        ressl_loss = ressl_loss_func(q, k, queue, self.temperature_q, self.temperature_k)
+
+        self.log("val_loss", ressl_loss, on_epoch=True, sync_dist=True)
+
+        # dequeue and enqueue
+        self.dequeue_and_enqueue(k)
+
+        return ressl_loss + class_loss
+

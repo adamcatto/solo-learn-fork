@@ -132,3 +132,21 @@ class VICReg(BaseMethod):
         self.log("train_vicreg_loss", vicreg_loss, on_epoch=True, sync_dist=True)
 
         return vicreg_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        z1, z2 = out["z"]
+
+        # ------- vicreg loss -------
+        vicreg_loss = vicreg_loss_func(
+            z1,
+            z2,
+            sim_loss_weight=self.sim_loss_weight,
+            var_loss_weight=self.var_loss_weight,
+            cov_loss_weight=self.cov_loss_weight,
+        )
+
+        self.log("val_loss", vicreg_loss, on_epoch=True, sync_dist=True)
+
+        return vicreg_loss + class_loss

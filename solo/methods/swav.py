@@ -228,3 +228,22 @@ class SwAV(BaseMethod):
         if self.current_epoch < self.freeze_prototypes_epochs:
             for p in self.prototypes.parameters():
                 p.grad = None
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        preds = out["p"]
+
+        # ------- swav loss -------
+        assignments = self.get_assignments(preds[: self.num_large_crops])
+        swav_loss = swav_loss_func(preds, assignments, self.temperature)
+
+        # ------- update queue -------
+        if self.queue_size > 0:
+            z = torch.stack(out["z"][: self.num_large_crops])
+            self.queue[:, z.size(1) :] = self.queue[:, : -z.size(1)].clone()
+            self.queue[:, : z.size(1)] = z.detach()
+
+        self.log("val_loss", swav_loss, on_epoch=True, sync_dist=True)
+
+        return swav_loss + class_loss

@@ -135,3 +135,24 @@ class SupCon(BaseMethod):
         self.log("train_nce_loss", nce_loss, on_epoch=True, sync_dist=True)
 
         return nce_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        targets = batch[-1]
+
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        z = torch.cat(out["z"])
+
+        # ------- contrastive loss -------
+        n_augs = self.num_large_crops + self.num_small_crops
+        targets = targets.repeat(n_augs)
+
+        nce_loss = simclr_loss_func(
+            z,
+            indexes=targets,
+            temperature=self.temperature,
+        )
+
+        self.log("val_loss", nce_loss, on_epoch=True, sync_dist=True)
+
+        return nce_loss + class_loss

@@ -215,3 +215,36 @@ class NNCLR(BaseMethod):
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
         return nnclr_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        targets = batch[-1]
+
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        z1, z2 = out["z"]
+        p1, p2 = out["p"]
+
+        # find nn
+        idx1, nn1 = self.find_nn(z1)
+        _, nn2 = self.find_nn(z2)
+
+        # ------- contrastive loss -------
+        nnclr_loss = (
+            nnclr_loss_func(nn1, p2, temperature=self.temperature) / 2
+            + nnclr_loss_func(nn2, p1, temperature=self.temperature) / 2
+        )
+
+        # compute nn accuracy
+        b = targets.size(0)
+        nn_acc = (targets == self.queue_y[idx1]).sum() / b
+
+        # dequeue and enqueue
+        self.dequeue_and_enqueue(z1, targets)
+        metrics = {
+            "val_loss": nnclr_loss,
+            "val_nn_acc": nn_acc,
+        }
+        self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+        return nnclr_loss + class_loss
+

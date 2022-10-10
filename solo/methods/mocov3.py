@@ -218,3 +218,20 @@ class MoCoV3(BaseMomentumMethod):
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
         return contrastive_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        Q = out["q"]
+        K = out["momentum_k"]
+
+        contrastive_loss = mocov3_loss_func(
+            Q[0], K[1], temperature=self.temperature
+        ) + mocov3_loss_func(Q[1], K[0], temperature=self.temperature)
+
+        metrics = {
+            "val_loss": contrastive_loss,
+        }
+        self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+        return contrastive_loss + class_loss

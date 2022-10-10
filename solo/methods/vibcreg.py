@@ -137,3 +137,21 @@ class VIbCReg(BaseMethod):
         self.log("train_vibcreg_loss", vibcreg_loss, on_epoch=True, sync_dist=True)
 
         return vibcreg_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        z1, z2 = out["z"]
+
+        # ------- vibcreg loss -------
+        vibcreg_loss = vibcreg_loss_func(
+            z1,
+            z2,
+            sim_loss_weight=self.sim_loss_weight,
+            var_loss_weight=self.var_loss_weight,
+            cov_loss_weight=self.cov_loss_weight,
+        )
+
+        self.log("val_loss", vibcreg_loss, on_epoch=True, sync_dist=True)
+
+        return vibcreg_loss + class_loss

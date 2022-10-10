@@ -136,3 +136,24 @@ class SimCLR(BaseMethod):
         self.log("train_nce_loss", nce_loss, on_epoch=True, sync_dist=True)
 
         return nce_loss + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        indexes = batch[0]
+
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        z = torch.cat(out["z"])
+
+        # ------- contrastive loss -------
+        n_augs = self.num_large_crops + self.num_small_crops
+        indexes = indexes.repeat(n_augs)
+
+        nce_loss = simclr_loss_func(
+            z,
+            indexes=indexes,
+            temperature=self.temperature,
+        )
+
+        self.log("val_loss", nce_loss, on_epoch=True, sync_dist=True)
+
+        return nce_loss + class_loss

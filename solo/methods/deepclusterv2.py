@@ -209,3 +209,24 @@ class DeepClusterV2(BaseMethod):
         self.log("train_deepcluster_loss", deepcluster_loss, on_epoch=True, sync_dist=True)
 
         return deepcluster_loss + class_loss
+
+
+    def validation_step(self, batch, batch_idx):
+        idxs = batch[0]
+
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        z1, z2 = out["z"]
+        p1, p2 = out["p"]
+
+        # ------- deepclusterv2 loss -------
+        preds = torch.stack([p1.unsqueeze(1), p2.unsqueeze(1)], dim=1)
+        assignments = self.assignments[:, idxs]
+        deepcluster_loss = deepclusterv2_loss_func(preds, assignments, self.temperature)
+
+        # ------- update memory banks -------
+        self.update_memory_banks(idxs, [z1, z2], batch_idx)
+
+        self.log("val_loss", deepcluster_loss, on_epoch=True, sync_dist=True)
+
+        return deepcluster_loss + class_loss

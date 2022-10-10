@@ -296,7 +296,7 @@ class DINO(BaseMomentumMethod):
         # ------- contrastive loss -------
         dino_loss = self.dino_loss_func(p, momentum_p)
 
-        self.log("dino_loss", dino_loss, on_epoch=True, sync_dist=True)
+        self.log("dino_train_loss", dino_loss, on_epoch=True, sync_dist=True)
 
         return dino_loss + class_loss
 
@@ -310,3 +310,17 @@ class DINO(BaseMomentumMethod):
         if self.current_epoch < self.freeze_last_layer:
             for p in self.head.last_layer.parameters():
                 p.grad = None
+
+
+    def validation_step(self, batch, batch_idx):
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        p = torch.cat(out["z"])
+        momentum_p = torch.cat(out["momentum_z"])
+
+        # ------- contrastive loss -------
+        dino_loss = self.dino_loss_func(p, momentum_p)
+
+        self.log("val_loss", dino_loss, on_epoch=True, sync_dist=True)
+
+        return dino_loss + class_loss

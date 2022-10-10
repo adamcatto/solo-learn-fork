@@ -372,7 +372,6 @@ class LinearModel(pl.LightningModule):
                 dict with the batch_size (used for averaging),
                 the classification loss and accuracies.
         """
-        print('val_' + str(batch_idx))
         X, target = batch
         out, logits = self.shared_step(batch, batch_idx)
 
@@ -382,7 +381,6 @@ class LinearModel(pl.LightningModule):
         }
         pos_prob = logits.softmax(dim=1)[:, 1]
         self.auroc.update(pos_prob, target.int()[:,1])
-        print(self.auroc)
         self.log('val_loss', out['loss'], sync_dist=True, on_step=False, prog_bar=True, on_epoch=True)
         return results
 
@@ -394,7 +392,6 @@ class LinearModel(pl.LightningModule):
         Args:
             outs (List[Dict[str, Any]]): list of outputs of the validation step.
         """
-        print('validation epoch complete')
         val_loss = weighted_mean(outs, "val_loss", "batch_size")
         
         log = {"val_loss": val_loss, 'val_auroc_epoch': self.auroc.compute()}

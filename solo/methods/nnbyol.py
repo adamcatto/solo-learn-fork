@@ -253,3 +253,41 @@ class NNBYOL(BaseMomentumMethod):
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
         return neg_cos_sim + class_loss
+
+    def validation_step(self, batch, batch_idx):
+        targets = batch[-1]
+
+        out = super().validation_step(batch, batch_idx)
+        class_loss = out["loss"]
+        z1, z2 = out["z"]
+        p1, p2 = out["p"]
+        z1_momentum, z2_momentum = out["momentum_z"]
+
+        # find nn
+        idx1, nn1_momentum = self.find_nn(z1_momentum)
+        _, nn2_momentum = self.find_nn(z2_momentum)
+
+        # ------- negative cosine similarity loss -------
+        neg_cos_sim = byol_loss_func(p1, nn2_momentum) + byol_loss_func(p2, nn1_momentum)
+
+        # compute nn accuracy
+        b = targets.size(0)
+        nn_acc = (targets == self.queue_y[idx1]).sum() / b
+
+        # dequeue and enqueue
+        self.dequeue_and_enqueue(z1_momentum, targets)
+
+        # calculate std of features
+        z1_std = F.normalize(z1, dim=-1).std(dim=0).mean()
+        z2_std = F.normalize(z2, dim=-1).std(dim=0).mean()
+        z_std = (z1_std + z2_std) / 2
+
+        metrics = {
+            "val_neg_cos_sim": neg_cos_sim,
+            "val_z_std": z_std,
+            "val_nn_acc": nn_acc,
+            "val_loss": neg_cos_sim # for checkpointing on val_loss
+        }
+        self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+        return neg_cos_sim + class_loss
